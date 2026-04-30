@@ -1,0 +1,22 @@
+# Data files — large binaries, not suited for git history
+data/*.csv.gz
+data/*.csv.zip
+data/*.zip
+data/*.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+*.egg-info/
+
+# OS
+.DS_Store
+.AppleDouble
+
+# Claude Code internal
+.claude/
+
+# Streamlit
+.streamlit/
