@@ -34,12 +34,12 @@ GRAY   = "#8b949e"   # muted
 CHART_TEMPLATE = "plotly_dark"
 
 
-@st.cache_data(show_spinner="Loading files…")
+@st.cache_data(show_spinner="Loading files…", max_entries=2, ttl=1800)
 def _load_range_cached(paths: tuple[str, ...]) -> pd.DataFrame:
     return load_sessions_concat(paths)
 
 
-@st.cache_data(show_spinner="Loading merged day…")
+@st.cache_data(show_spinner="Loading merged day…", max_entries=2, ttl=1800)
 def _load_merged_cached(path: str) -> pd.DataFrame:
     return load_merged_day(path)
 
