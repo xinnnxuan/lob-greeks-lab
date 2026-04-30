@@ -48,10 +48,6 @@ def snapshot_at(df: pd.DataFrame, ts: pd.Timestamp) -> pd.DataFrame:
     return df[df["timestamp"] == ts].copy()
 
 
-def _hhmm(path) -> str:
-    stem = path.name.replace(".csv.gz", "")
-    return stem.split("_")[-1]
-
 
 def _atm_iv(snap: pd.DataFrame) -> str:
     """Return ATM call IV as a formatted string, or '—' if unavailable."""
@@ -104,29 +100,26 @@ def main():
         )
 
         if sel_date in merged_days:
-            st.success("Full day loaded (pre-merged)")
-            choice = f"{sel_date}_full"
-            df = _load_merged_cached(str(merged_days[sel_date]))
+            df_full = _load_merged_cached(str(merged_days[sel_date]))
         else:
-            day_files   = date_groups.get(sel_date, [])
-            times       = [_hhmm(f) for f in day_files]
-            time_labels = [f"{t[:2]}:{t[2:]}" for t in times]
+            day_files = date_groups.get(sel_date, [])
+            df_full = _load_range_cached(tuple(str(f) for f in day_files))
 
-            if len(day_files) == 1:
-                start_i, end_i = 0, 0
-            else:
-                start_i, end_i = st.select_slider(
-                    "Time window (UTC)",
-                    options=list(range(len(day_files))),
-                    value=(0, len(day_files) - 1),
-                    format_func=lambda i: time_labels[i],
-                )
+        # always show time window slider
+        ts_all = sorted(df_full["timestamp"].dropna().unique())
+        if len(ts_all) > 1:
+            t_start, t_end = st.select_slider(
+                "Time window (UTC)",
+                options=ts_all,
+                value=(ts_all[0], ts_all[-1]),
+                format_func=lambda t: pd.Timestamp(t).strftime("%H:%M"),
+            )
+            df = df_full[(df_full["timestamp"] >= t_start) & (df_full["timestamp"] <= t_end)].copy()
+        else:
+            t_start, t_end = ts_all[0], ts_all[0]
+            df = df_full.copy()
 
-            selected_paths = tuple(str(f) for f in day_files[start_i : end_i + 1])
-            n_files = len(selected_paths)
-            choice  = f"{sel_date}_{time_labels[start_i]}-{time_labels[end_i]}"
-            st.caption(f"{n_files} file{'s' if n_files != 1 else ''} · {time_labels[start_i]} – {time_labels[end_i]} UTC")
-            df = _load_range_cached(selected_paths)
+        choice = f"{sel_date}_{pd.Timestamp(t_start).strftime('%H%M')}-{pd.Timestamp(t_end).strftime('%H%M')}"
 
         ts_list = sorted(df["timestamp"].dropna().unique())
         if not ts_list:
@@ -134,7 +127,7 @@ def main():
             st.stop()
 
         sel_ts = st.select_slider(
-            "Snapshot time (UTC)",
+            "Snapshot (UTC)",
             options=ts_list,
             value=ts_list[-1],
             format_func=lambda t: pd.Timestamp(t).strftime("%H:%M:%S"),
@@ -154,23 +147,23 @@ def main():
                     key="compare_date",
                 )
                 if sel_date2 in merged_days:
-                    df2 = _load_merged_cached(str(merged_days[sel_date2]))
+                    df2_full = _load_merged_cached(str(merged_days[sel_date2]))
                 else:
-                    day_files2  = date_groups.get(sel_date2, [])
-                    times2      = [_hhmm(f) for f in day_files2]
-                    tlabels2    = [f"{t[:2]}:{t[2:]}" for t in times2]
-                    if len(day_files2) > 1:
-                        s2, e2 = st.select_slider(
-                            "Time window (date 2)",
-                            options=list(range(len(day_files2))),
-                            value=(0, min(len(day_files2) - 1, 29)),
-                            format_func=lambda i: tlabels2[i],
-                            key="compare_window",
-                        )
-                    else:
-                        s2, e2 = 0, 0
-                    paths2 = tuple(str(f) for f in day_files2[s2 : e2 + 1])
-                    df2 = _load_range_cached(paths2)
+                    day_files2 = date_groups.get(sel_date2, [])
+                    df2_full = _load_range_cached(tuple(str(f) for f in day_files2))
+
+                ts2_all = sorted(df2_full["timestamp"].dropna().unique())
+                if len(ts2_all) > 1:
+                    t2_start, t2_end = st.select_slider(
+                        "Time window (date 2, UTC)",
+                        options=ts2_all,
+                        value=(ts2_all[0], ts2_all[-1]),
+                        format_func=lambda t: pd.Timestamp(t).strftime("%H:%M"),
+                        key="compare_window",
+                    )
+                    df2 = df2_full[(df2_full["timestamp"] >= t2_start) & (df2_full["timestamp"] <= t2_end)].copy()
+                else:
+                    df2 = df2_full.copy()
             else:
                 st.info("Only one date available — add more data to enable comparison.")
 
