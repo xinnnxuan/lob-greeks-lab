@@ -78,5 +78,23 @@ def load_sessions_concat(paths: tuple[str, ...]) -> pd.DataFrame:
     return pd.concat(frames, ignore_index=True).sort_values("timestamp").reset_index(drop=True)
 
 
+def load_merged_day(path: str | Path) -> pd.DataFrame:
+    """Load a pre-merged daily CSV.gz produced by merge_daily.py."""
+    df = pd.read_csv(path, compression="gzip")
+    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+    if "MBO_depth" not in df.columns:
+        df["MBO_depth"] = 0.0
+    return df
+
+
+def list_merged_days(data_dir: str | Path) -> dict[str, Path]:
+    """Return date -> Path for any pre-merged day_YYYYMMDD.csv.gz files."""
+    data_dir = Path(data_dir)
+    return {
+        p.name.replace("day_", "").replace(".csv.gz", ""): p
+        for p in sorted(data_dir.glob("day_*.csv.gz"))
+    }
+
+
 def default_data_dir() -> Path:
     return Path(__file__).resolve().parent / "data"
