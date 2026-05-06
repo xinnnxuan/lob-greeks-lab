@@ -17,6 +17,20 @@ GDRIVE_FILES = {
 _DOWNLOAD_DONE = False
 
 
+def _download_file(file_id: str, dest: Path) -> bool:
+    """Download a single file from Google Drive using requests."""
+    import requests
+    session = requests.Session()
+    url = "https://drive.usercontent.google.com/download"
+    params = {"id": file_id, "export": "download", "confirm": "t"}
+    with session.get(url, params=params, stream=True, timeout=300) as r:
+        r.raise_for_status()
+        with open(dest, "wb") as f:
+            for chunk in r.iter_content(chunk_size=1024 * 1024):
+                f.write(chunk)
+    return dest.stat().st_size > 1000
+
+
 def _download_from_gdrive(data_dir: Path) -> None:
     """Download day_*.csv.gz files from Google Drive, once per process."""
     global _DOWNLOAD_DONE
@@ -24,21 +38,20 @@ def _download_from_gdrive(data_dir: Path) -> None:
         return
     _DOWNLOAD_DONE = True
 
-    try:
-        import gdown
-    except ImportError:
-        return
-
     data_dir.mkdir(parents=True, exist_ok=True)
 
     for name, file_id in GDRIVE_FILES.items():
         dest = data_dir / name
         if dest.exists() and dest.stat().st_size > 1000:
             continue
+        print(f"Downloading {name}...")
         try:
-            gdown.download(id=file_id, output=str(dest), quiet=False, fuzzy=True)
-        except Exception:
-            pass
+            _download_file(file_id, dest)
+            print(f"Downloaded {name} ({dest.stat().st_size / 1e6:.0f} MB)")
+        except Exception as e:
+            print(f"ERROR downloading {name}: {e}")
+            if dest.exists():
+                dest.unlink(missing_ok=True)
 
 
 def _mbo_depth(val) -> float:
