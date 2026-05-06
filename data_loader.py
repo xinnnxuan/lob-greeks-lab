@@ -10,48 +10,6 @@ from pathlib import Path
 
 import pandas as pd
 
-GDRIVE_FILES = {
-    "day_20250414.csv.gz": "1qTUYapcavG2EisXgNXDZcfHwJO9NU1vU",
-    "day_20250415.csv.gz": "1ocEoypXad0RjsKJFM-o71SGEGLEeeA5g",
-}
-_DOWNLOAD_DONE = False
-
-
-def _download_file(file_id: str, dest: Path) -> bool:
-    """Download a single file from Google Drive using requests."""
-    import requests
-    session = requests.Session()
-    url = "https://drive.usercontent.google.com/download"
-    params = {"id": file_id, "export": "download", "confirm": "t"}
-    with session.get(url, params=params, stream=True, timeout=300) as r:
-        r.raise_for_status()
-        with open(dest, "wb") as f:
-            for chunk in r.iter_content(chunk_size=1024 * 1024):
-                f.write(chunk)
-    return dest.stat().st_size > 1000
-
-
-def _download_from_gdrive(data_dir: Path) -> None:
-    """Download day_*.csv.gz files from Google Drive, once per process."""
-    global _DOWNLOAD_DONE
-    if _DOWNLOAD_DONE:
-        return
-    _DOWNLOAD_DONE = True
-
-    data_dir.mkdir(parents=True, exist_ok=True)
-
-    for name, file_id in GDRIVE_FILES.items():
-        dest = data_dir / name
-        if dest.exists() and dest.stat().st_size > 1000:
-            continue
-        print(f"Downloading {name}...")
-        try:
-            _download_file(file_id, dest)
-            print(f"Downloaded {name} ({dest.stat().st_size / 1e6:.0f} MB)")
-        except Exception as e:
-            print(f"ERROR downloading {name}: {e}")
-            if dest.exists():
-                dest.unlink(missing_ok=True)
 
 
 def _mbo_depth(val) -> float:
@@ -147,15 +105,19 @@ def load_merged_day(path: str | Path) -> pd.DataFrame:
 
 
 def list_merged_days(data_dir: str | Path) -> dict[str, Path]:
-    """Return date -> Path for any pre-merged day_YYYYMMDD.csv.gz files."""
+    """Return date -> Path for merged or sample day files."""
     data_dir = Path(data_dir)
-    return {
-        p.name.replace("day_", "").replace(".csv.gz", ""): p
-        for p in sorted(data_dir.glob("day_*.csv.gz"))
-    }
+    result = {}
+    # prefer full day files, fall back to sample files
+    for p in sorted(data_dir.glob("day_*.csv.gz")):
+        date = p.name.replace("day_", "").replace(".csv.gz", "")
+        result[date] = p
+    for p in sorted(data_dir.glob("sample_day_*.csv.gz")):
+        date = p.name.replace("sample_day_", "").replace(".csv.gz", "")
+        if date not in result:
+            result[date] = p
+    return result
 
 
 def default_data_dir() -> Path:
-    d = Path(__file__).resolve().parent / "data"
-    _download_from_gdrive(d)
-    return d
+    return Path(__file__).resolve().parent / "data"
