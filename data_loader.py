@@ -11,24 +11,38 @@ from pathlib import Path
 import pandas as pd
 
 GDRIVE_FOLDER_ID = "1j90YqlYwaeoV32ksz2-ruz11wxA9GNtl"
+_DOWNLOAD_DONE = False
 
 
 def _download_from_gdrive(data_dir: Path) -> None:
-    """Download merged day files from Google Drive if none exist locally."""
-    existing = list(data_dir.glob("day_*.csv.gz"))
+    """Download only day_*.csv.gz files from Google Drive, once per process."""
+    global _DOWNLOAD_DONE
+    if _DOWNLOAD_DONE:
+        return
+    _DOWNLOAD_DONE = True
+
+    existing = [f for f in data_dir.glob("day_*.csv.gz") if f.stat().st_size > 1000]
     if existing:
         return
+
     try:
         import gdown
     except ImportError:
         return
+
     data_dir.mkdir(parents=True, exist_ok=True)
+
+    # Download entire folder then remove anything that isn't a day file
     gdown.download_folder(
         id=GDRIVE_FOLDER_ID,
         output=str(data_dir),
         quiet=False,
         use_cookies=False,
     )
+
+    for f in data_dir.iterdir():
+        if f.is_file() and not f.name.startswith("day_"):
+            f.unlink(missing_ok=True)
 
 
 def _mbo_depth(val) -> float:
