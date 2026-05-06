@@ -87,31 +87,21 @@ def build_snapshot_panel(df: pd.DataFrame) -> pd.DataFrame:
     panel["depth_imbalance"] = (panel["bid_depth"] - panel["ask_depth"]) / dsum
     panel["depth_imbalance"] = panel["depth_imbalance"].fillna(0.0)
 
-    atm_rows: list[dict] = []
-    for ts, g in d.groupby("timestamp", sort=True):
-        spx = float(g["spx_price"].iloc[0])
-        u = g.drop_duplicates(subset=["future_strike"], keep="first")
-        if u.empty:
-            atm_rows.append({"timestamp": ts, "atm_call_delta": np.nan, "atm_call_vega": np.nan})
-            continue
-        strikes = pd.to_numeric(u["future_strike"], errors="coerce")
-        if strikes.notna().sum() == 0:
-            atm_rows.append({"timestamp": ts, "atm_call_delta": np.nan, "atm_call_vega": np.nan})
-            continue
-        idx = (strikes - spx).abs().idxmin()
-        row = u.loc[idx]
-        cd = row["call_delta"] if "call_delta" in row.index and pd.notna(row.get("call_delta")) else np.nan
-        cv = row["call_vega"] if "call_vega" in row.index and pd.notna(row.get("call_vega")) else np.nan
-        atm_rows.append(
-            {
-                "timestamp": ts,
-                "atm_call_delta": float(cd) if pd.notna(cd) else np.nan,
-                "atm_call_vega": float(cv) if pd.notna(cv) else np.nan,
-            }
-        )
-    atm_df = pd.DataFrame(atm_rows).set_index("timestamp")
-    panel["atm_call_delta"] = atm_df["atm_call_delta"].reindex(panel.index)
-    panel["atm_call_vega"] = atm_df["atm_call_vega"].reindex(panel.index)
+    d_atm = d.copy()
+    d_atm["_fs"] = pd.to_numeric(d_atm["future_strike"], errors="coerce")
+    d_atm["_spx"] = pd.to_numeric(d_atm["spx_price"], errors="coerce")
+    d_atm = d_atm.dropna(subset=["_fs"]).drop_duplicates(subset=["timestamp", "_fs"])
+    d_atm["_dist"] = (d_atm["_fs"] - d_atm["_spx"]).abs()
+    atm_idx = d_atm.groupby("timestamp")["_dist"].idxmin()
+    atm_rows_df = d_atm.loc[atm_idx].set_index("timestamp")
+    panel["atm_call_delta"] = pd.to_numeric(
+        atm_rows_df["call_delta"] if "call_delta" in atm_rows_df.columns else pd.Series(dtype=float),
+        errors="coerce",
+    ).reindex(panel.index)
+    panel["atm_call_vega"] = pd.to_numeric(
+        atm_rows_df["call_vega"] if "call_vega" in atm_rows_df.columns else pd.Series(dtype=float),
+        errors="coerce",
+    ).reindex(panel.index)
 
     panel = panel.sort_index()
     ret_px, note = _pick_return_price(panel["spx"], panel["es_ref"])
@@ -126,26 +116,14 @@ def forward_realized_vol(log_ret: pd.Series, h: int) -> pd.Series:
     At index i, sqrt(sum of squared log returns from i+1 .. i+h inclusive).
     Last h rows are NaN.
     """
-    r = log_ret.to_numpy(dtype=float)
-    n = len(r)
-    out = np.full(n, np.nan)
-    for i in range(n - h):
-        window = r[i + 1 : i + 1 + h]
-        if np.isfinite(window).all():
-            out[i] = float(np.sqrt(np.sum(window**2)))
-    return pd.Series(out, index=log_ret.index)
+    r2 = log_ret ** 2
+    # rolling(h).sum() at position i covers [i-h+1, i]; shift(-h) maps it to [i+1, i+h]
+    return np.sqrt(r2.rolling(h, min_periods=h).sum().shift(-h))
 
 
 def past_realized_vol(log_ret: pd.Series, w: int) -> pd.Series:
     """sqrt(sum of squared returns over previous w steps, ending at t)."""
-    r = log_ret.to_numpy(dtype=float)
-    n = len(r)
-    out = np.full(n, np.nan)
-    for i in range(w, n):
-        window = r[i - w : i]
-        if np.isfinite(window).all():
-            out[i] = float(np.sqrt(np.sum(window**2)))
-    return pd.Series(out, index=log_ret.index)
+    return np.sqrt((log_ret ** 2).rolling(w, min_periods=w).sum())
 
 
 def build_feature_matrix(panel: pd.DataFrame, lookback: int, horizon: int) -> tuple[pd.DataFrame, pd.Series, list[str]]:
@@ -180,26 +158,17 @@ def build_feature_matrix(panel: pd.DataFrame, lookback: int, horizon: int) -> tu
 
 # ── IV Smile ────────────────────────────────────────────────────────────────
 
-def _iv_from_call_delta(call_delta: float, log_s_over_k: float, t: float) -> float:
-    """
-    Back out annualized BSM IV from call delta using the quadratic formula.
-
-    BSM: d1 = (ln(S/K) + σ²t/2) / (σ√t)
-    Setting u = σ√t gives: u²/2 - d1·u + ln(S/K) = 0
-    => u = d1 ± √(d1² - 2·ln(S/K));  σ = u / √t
-    """
-    if not (0.002 < call_delta < 0.998) or t <= 0:
-        return float("nan")
-    d1 = float(norm.ppf(call_delta))
+def _iv_from_call_delta_vec(call_delta: np.ndarray, log_s_over_k: np.ndarray, t: float) -> np.ndarray:
+    """Back out annualized BSM IV from call delta array using the quadratic formula."""
+    valid = (call_delta > 0.002) & (call_delta < 0.998) & np.isfinite(call_delta) & np.isfinite(log_s_over_k)
+    d1 = np.where(valid, norm.ppf(np.clip(call_delta, 1e-6, 1 - 1e-6)), np.nan)
     discriminant = d1 ** 2 - 2.0 * log_s_over_k
-    if discriminant < 0:
-        return float("nan")
-    u = d1 + discriminant ** 0.5
-    if u <= 0:
-        u = d1 - discriminant ** 0.5
-    if u <= 0:
-        return float("nan")
-    return u / (t ** 0.5)
+    disc_ok = valid & (discriminant >= 0)
+    sqrt_disc = np.where(disc_ok, np.sqrt(np.maximum(discriminant, 0.0)), np.nan)
+    u = np.where(disc_ok, d1 + sqrt_disc, np.nan)
+    # use negative root where positive root is non-positive
+    u = np.where(disc_ok & (u <= 0), d1 - sqrt_disc, u)
+    return np.where(disc_ok & (u > 0), u / np.sqrt(t), np.nan)
 
 
 def build_iv_smile(snap: pd.DataFrame) -> pd.DataFrame:
@@ -216,34 +185,23 @@ def build_iv_smile(snap: pd.DataFrame) -> pd.DataFrame:
     if spx <= 0 or t <= 0:
         return pd.DataFrame()
 
-    rows: list[dict] = []
-    sub = snap.drop_duplicates(subset=["future_strike"], keep="first")
-    for _, row in sub.iterrows():
-        K = float(row["future_strike"])
-        if K <= 0:
-            continue
-        log_s_k = float(np.log(spx / K))  # ln(S/K)
-        call_iv = put_iv = float("nan")
+    sub = snap.drop_duplicates(subset=["future_strike"], keep="first").copy()
+    K = pd.to_numeric(sub["future_strike"], errors="coerce")
+    sub = sub[K > 0].copy()
+    K = K[K > 0].values
 
-        cd = row.get("call_delta")
-        if pd.notna(cd):
-            call_iv = _iv_from_call_delta(float(cd), log_s_k, t)
+    log_s_k = np.log(spx / K)
+    cd = pd.to_numeric(sub["call_delta"], errors="coerce").values
+    pd_col = sub["put_delta"] if "put_delta" in sub.columns else pd.Series(np.nan, index=sub.index)
+    pd_vals = pd.to_numeric(pd_col, errors="coerce").values
 
-        pd_ = row.get("put_delta")
-        if pd.notna(pd_):
-            # put_delta = -N(-d1)  =>  N(d1) = 1 + put_delta
-            put_iv = _iv_from_call_delta(float(pd_) + 1.0, log_s_k, t)
-
-        rows.append(
-            {
-                "future_strike": K,
-                "moneyness": float(np.log(K / spx)),
-                "call_iv": call_iv,
-                "put_iv": put_iv,
-            }
-        )
-
-    return pd.DataFrame(rows).sort_values("future_strike").reset_index(drop=True)
+    return pd.DataFrame({
+        "future_strike": K,
+        "moneyness": np.log(K / spx),
+        "call_iv": _iv_from_call_delta_vec(cd, log_s_k, t),
+        # put_delta = -N(-d1)  =>  N(d1) = 1 + put_delta
+        "put_iv": _iv_from_call_delta_vec(pd_vals + 1.0, log_s_k, t),
+    }).sort_values("future_strike").reset_index(drop=True)
 
 
 # ── Imbalance signal ─────────────────────────────────────────────────────────

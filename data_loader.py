@@ -10,6 +10,26 @@ from pathlib import Path
 
 import pandas as pd
 
+GDRIVE_FOLDER_ID = "1j90YqlYwaeoV32ksz2-ruz11wxA9GNtl"
+
+
+def _download_from_gdrive(data_dir: Path) -> None:
+    """Download merged day files from Google Drive if none exist locally."""
+    existing = list(data_dir.glob("day_*.csv.gz"))
+    if existing:
+        return
+    try:
+        import gdown
+    except ImportError:
+        return
+    data_dir.mkdir(parents=True, exist_ok=True)
+    gdown.download_folder(
+        id=GDRIVE_FOLDER_ID,
+        output=str(data_dir),
+        quiet=False,
+        use_cookies=False,
+    )
+
 
 def _mbo_depth(val) -> float:
     if val is None or (isinstance(val, float) and pd.isna(val)):
@@ -80,7 +100,23 @@ def load_sessions_concat(paths: tuple[str, ...]) -> pd.DataFrame:
 
 def load_merged_day(path: str | Path) -> pd.DataFrame:
     """Load a pre-merged daily CSV.gz produced by merge_daily.py."""
-    df = pd.read_csv(path, compression="gzip")
+    import io as _io
+    try:
+        df = pd.read_csv(path, compression="gzip")
+    except EOFError:
+        # Truncated gzip — recover whatever bytes decompressed successfully.
+        chunks: list[bytes] = []
+        with open(path, "rb") as f:
+            gz = gzip.GzipFile(fileobj=f)
+            while True:
+                try:
+                    chunk = gz.read(65536)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                except EOFError:
+                    break
+        df = pd.read_csv(_io.BytesIO(b"".join(chunks)), on_bad_lines="skip")
     df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
     if "MBO_depth" not in df.columns:
         df["MBO_depth"] = 0.0
@@ -97,4 +133,6 @@ def list_merged_days(data_dir: str | Path) -> dict[str, Path]:
 
 
 def default_data_dir() -> Path:
-    return Path(__file__).resolve().parent / "data"
+    d = Path(__file__).resolve().parent / "data"
+    _download_from_gdrive(d)
+    return d

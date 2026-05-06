@@ -44,9 +44,13 @@ def _load_merged_cached(path: str) -> pd.DataFrame:
     return load_merged_day(path)
 
 
+@st.cache_data(show_spinner="Building panel…", max_entries=6, ttl=1800)
+def _build_panel_cached(cache_key: str, _df: pd.DataFrame) -> pd.DataFrame:
+    return build_snapshot_panel(_df)
+
+
 def snapshot_at(df: pd.DataFrame, ts: pd.Timestamp) -> pd.DataFrame:
     return df[df["timestamp"] == ts].copy()
-
 
 
 def _atm_iv(snap: pd.DataFrame) -> str:
@@ -62,6 +66,43 @@ def _atm_iv(snap: pd.DataFrame) -> str:
     idx = (valid["future_strike"] - spx).abs().idxmin()
     iv = valid.loc[idx, "call_iv"]
     return f"{iv * 100:.1f}%" if pd.notna(iv) else "—"
+
+
+@st.cache_data(show_spinner="Building vol surface…", max_entries=4, ttl=1800)
+def _build_vol_surface(cache_key: str, _df: pd.DataFrame, n_samples: int = 60) -> pd.DataFrame:
+    """Sample up to n_samples evenly-spaced timestamps and build a vol surface DataFrame.
+
+    Returns a DataFrame with columns: time (HH:MM string), strike (float), call_iv (float ×100 %).
+    """
+    ts_all = sorted(_df["timestamp"].dropna().unique())
+    if len(ts_all) == 0:
+        return pd.DataFrame(columns=["time", "strike", "call_iv"])
+
+    # evenly-spaced indices
+    if len(ts_all) <= n_samples:
+        indices = list(range(len(ts_all)))
+    else:
+        indices = [int(round(i * (len(ts_all) - 1) / (n_samples - 1))) for i in range(n_samples)]
+        indices = sorted(set(indices))
+
+    rows = []
+    for idx in indices:
+        ts = ts_all[idx]
+        snap_i = _df[_df["timestamp"] == ts].copy()
+        smile_i = build_iv_smile(snap_i)
+        if smile_i.empty or "call_iv" not in smile_i.columns:
+            continue
+        valid_i = smile_i.dropna(subset=["call_iv"])
+        for _, row in valid_i.iterrows():
+            rows.append({
+                "time": pd.Timestamp(ts).strftime("%H:%M"),
+                "strike": float(row["future_strike"]),
+                "call_iv": float(row["call_iv"]) * 100,
+            })
+
+    if not rows:
+        return pd.DataFrame(columns=["time", "strike", "call_iv"])
+    return pd.DataFrame(rows)
 
 
 def main():
@@ -126,13 +167,50 @@ def main():
             st.error("No valid timestamps in selected range.")
             st.stop()
 
+        # ── Feature 1: Jump to Open / Close buttons ───────────────────────────
+        snap_key = f"snap_ts_{choice}"
+        jb_col1, jb_col2 = st.columns(2)
+        with jb_col1:
+            if st.button("Open", use_container_width=True):
+                st.session_state[snap_key] = ts_list[0]
+        with jb_col2:
+            if st.button("Close", use_container_width=True):
+                st.session_state[snap_key] = ts_list[-1]
+
+        # Resolve the slider default value
+        _snap_default = st.session_state.get(snap_key, None)
+        if _snap_default is None or _snap_default not in ts_list:
+            _snap_default = ts_list[-1]
+
         sel_ts = st.select_slider(
             "Snapshot (UTC)",
             options=ts_list,
-            value=ts_list[-1],
+            value=_snap_default,
             format_func=lambda t: pd.Timestamp(t).strftime("%H:%M:%S"),
+            key=snap_key,
         )
         snap = snapshot_at(df, pd.Timestamp(sel_ts))
+
+        # ── Feature 2: Pin / Freeze reference snapshot ────────────────────────
+        ref_snap  = st.session_state.get("ref_snap",  None)
+        ref_label = st.session_state.get("ref_label", None)
+
+        pin_col1, pin_col2 = st.columns(2)
+        with pin_col1:
+            if st.button("Pin ref", use_container_width=True):
+                st.session_state["ref_snap"]  = snap.copy()
+                st.session_state["ref_label"] = pd.Timestamp(sel_ts).strftime("%H:%M:%S")
+                ref_snap  = st.session_state["ref_snap"]
+                ref_label = st.session_state["ref_label"]
+        with pin_col2:
+            if st.button("Clear", use_container_width=True, key="clear_ref"):
+                st.session_state.pop("ref_snap",  None)
+                st.session_state.pop("ref_label", None)
+                ref_snap  = None
+                ref_label = None
+
+        if ref_label is not None:
+            st.caption(f"Reference pinned: {ref_label}")
 
         # ── optional second session for comparison ────────────────────────────
         st.divider()
@@ -178,6 +256,25 @@ def main():
                 "**Imbalance** — (bid depth − ask depth) / total depth  \n"
             )
 
+        # ── Feature 3: Export buttons ─────────────────────────────────────────
+        st.divider()
+        with st.expander("Export data"):
+            _snap_time_str = pd.Timestamp(sel_ts).strftime("%H%M%S")
+            st.download_button(
+                label="Download snapshot (CSV)",
+                data=snap.to_csv(index=False),
+                file_name=f"snapshot_{sel_date}_{_snap_time_str}.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
+            st.download_button(
+                label="Download session (CSV)",
+                data=df.to_csv(index=False),
+                file_name=f"session_{sel_date}.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
+
         st.divider()
         st.caption(f"**{len(df):,}** rows · **{df['timestamp'].nunique()}** snapshots loaded")
 
@@ -185,7 +282,7 @@ def main():
         st.warning("Empty snapshot — try a different time.")
         st.stop()
 
-    panel = build_snapshot_panel(df)
+    panel = _build_panel_cached(choice, df)
 
     # ── top metrics row ───────────────────────────────────────────────────────
     meta  = snap.iloc[0]
@@ -259,6 +356,29 @@ def main():
             spx_val = float(snap["spx_price"].iloc[0])
             fig.add_hline(y=spx_val, line_dash="dot", line_color=RED,
                           annotation_text=f"Spot {spx_val:.0f}", annotation_position="right")
+
+            # Feature 2 — reference snapshot depth bars (30% opacity)
+            if ref_snap is not None and not ref_snap.empty:
+                ref_plot = ref_snap[ref_snap["MBO_depth"] >= min_depth].copy()
+                if zoom_atm:
+                    ref_plot = ref_plot[
+                        (ref_plot["future_strike"] >= spx_val - 50) &
+                        (ref_plot["future_strike"] <= spx_val + 50)
+                    ]
+                if not ref_plot.empty:
+                    for side, color in [("Bid", BLUE), ("Ask", GOLD)]:
+                        side_data = ref_plot[ref_plot["Side"] == side].sort_values("future_strike", ascending=False)
+                        if not side_data.empty:
+                            fig.add_trace(go.Bar(
+                                x=side_data["MBO_depth"],
+                                y=side_data["future_strike"],
+                                orientation="h",
+                                name=f"Ref {side} ({ref_label})",
+                                marker=dict(color=color, opacity=0.3),
+                                legendgroup=f"ref_{side}",
+                                hovertemplate=f"Ref {side}<br>Strike %{{y:.2f}}<br>Depth %{{x}}<extra></extra>",
+                            ))
+
             fig.update_layout(height=650, hovermode="y unified", template=CHART_TEMPLATE)
             st.plotly_chart(fig, use_container_width=True)
 
@@ -291,6 +411,11 @@ def main():
         with g_col2:
             side_choice = st.radio("Option side", ["Calls", "Puts", "Both"], horizontal=True)
 
+        # Build reference sub for Greeks overlay
+        ref_sub = None
+        if ref_snap is not None and not ref_snap.empty:
+            ref_sub = ref_snap.drop_duplicates(subset=["future_strike"]).sort_values("future_strike")
+
         def _greek_fig(prefix: str, label: str, color: str) -> go.Figure:
             fig = go.Figure()
             for g in sel_greeks:
@@ -302,6 +427,19 @@ def main():
                         marker=dict(size=4),
                         hovertemplate=f"Strike %{{x:.2f}}<br>{g.capitalize()} %{{y:.4f}}<extra></extra>",
                     ))
+            # Feature 2 — reference Greek lines (dashed, 50% opacity)
+            if ref_sub is not None:
+                for g in sel_greeks:
+                    col = f"{prefix}_{g}"
+                    if col in ref_sub.columns:
+                        fig.add_trace(go.Scatter(
+                            x=ref_sub["future_strike"], y=ref_sub[col],
+                            name=f"Ref {g.capitalize()} ({ref_label})",
+                            mode="lines",
+                            opacity=0.5,
+                            line=dict(dash="dash", width=1),
+                            hovertemplate=f"Ref Strike %{{x:.2f}}<br>{g.capitalize()} %{{y:.4f}}<extra></extra>",
+                        ))
             fig.add_vline(x=spx_val, line_dash="dot", line_color=RED,
                           annotation_text=f"Spot {spx_val:.0f}", annotation_position="top right")
             fig.update_layout(
@@ -556,6 +694,28 @@ def main():
                         line=dict(color=GOLD, width=2, dash="dot"), marker=dict(size=5),
                         hovertemplate="Strike %{x:.2f}<br>Put IV %{y:.2f}%<extra></extra>",
                     ))
+
+                # Feature 2 — reference call IV line (dashed, 50% opacity)
+                if ref_snap is not None and not ref_snap.empty:
+                    ref_smile = build_iv_smile(ref_snap)
+                    if not ref_smile.empty:
+                        ref_valid = ref_smile.dropna(subset=["call_iv"])
+                        if show_call_iv and not ref_valid.empty:
+                            ref_filtered = ref_valid[
+                                (ref_valid["moneyness"] >= mon_range[0]) &
+                                (ref_valid["moneyness"] <= mon_range[1])
+                            ]
+                            if not ref_filtered.empty:
+                                fig_smile.add_trace(go.Scatter(
+                                    x=ref_filtered["future_strike"],
+                                    y=ref_filtered["call_iv"] * 100,
+                                    mode="lines",
+                                    name=f"Ref Call IV ({ref_label})",
+                                    opacity=0.5,
+                                    line=dict(color=TEAL, width=2, dash="dash"),
+                                    hovertemplate="Strike %{x:.2f}<br>Ref Call IV %{y:.2f}%<extra></extra>",
+                                ))
+
                 fig_smile.add_vline(x=spx_val, line_dash="dash", line_color=RED,
                                     annotation_text=f"Spot {spx_val:.0f}", annotation_position="top right")
                 fig_smile.update_layout(
@@ -610,6 +770,50 @@ def main():
                     .reset_index(drop=True),
                     use_container_width=True,
                 )
+
+            # ── Feature 4: Vol Surface Heatmap ───────────────────────────────
+            with st.expander("Vol Surface (session)"):
+                vol_surf_df = _build_vol_surface(choice, df, n_samples=60)
+                if vol_surf_df.empty:
+                    st.info("Not enough data to build a vol surface for this session.")
+                else:
+                    # Pivot to matrix form for heatmap
+                    surf_pivot = vol_surf_df.pivot_table(
+                        index="strike", columns="time", values="call_iv", aggfunc="mean"
+                    )
+                    times   = list(surf_pivot.columns)
+                    strikes = list(surf_pivot.index)
+                    z_vals  = surf_pivot.values.tolist()
+
+                    fig_surf = go.Figure(go.Heatmap(
+                        x=times,
+                        y=strikes,
+                        z=z_vals,
+                        colorscale="RdYlGn_r",
+                        colorbar=dict(title="Call IV (%)"),
+                        hovertemplate="Time: %{x}<br>Strike: %{y:.2f}<br>Call IV: %{z:.2f}%<extra></extra>",
+                    ))
+
+                    # horizontal line at current spot price
+                    fig_surf.add_hline(
+                        y=spx_val,
+                        line_dash="dot",
+                        line_color=RED,
+                        annotation_text=f"Spot {spx_val:.0f}",
+                        annotation_position="right",
+                    )
+
+                    fig_surf.update_layout(
+                        xaxis_title="Time (UTC)",
+                        yaxis_title="Strike",
+                        height=450,
+                        template=CHART_TEMPLATE,
+                    )
+                    st.plotly_chart(fig_surf, use_container_width=True)
+                    st.caption(
+                        "Each cell shows the call IV at a given strike and time — "
+                        "red is higher implied vol, green is lower."
+                    )
 
     # ── Tab 5: LOB as a Signal (Imbalance) ───────────────────────────────────
     with t5:
