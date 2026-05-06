@@ -14,8 +14,21 @@ GDRIVE_FOLDER_ID = "1j90YqlYwaeoV32ksz2-ruz11wxA9GNtl"
 _DOWNLOAD_DONE = False
 
 
+def _gdrive_file_ids(folder_id: str) -> list[tuple[str, str]]:
+    """Return [(file_id, filename), ...] for files in a public Drive folder."""
+    import re
+    import urllib.request
+    url = f"https://drive.google.com/drive/folders/{folder_id}"
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        html = r.read().decode("utf-8", errors="ignore")
+    # Extract file IDs and names from the folder page JSON blob
+    pairs = re.findall(r'"([\w-]{28,})".*?"([^"]+\.csv\.gz)"', html)
+    return [(fid, name) for fid, name in pairs if name.startswith("day_")]
+
+
 def _download_from_gdrive(data_dir: Path) -> None:
-    """Download only day_*.csv.gz files from Google Drive, once per process."""
+    """Download day_*.csv.gz files from Google Drive, once per process."""
     global _DOWNLOAD_DONE
     if _DOWNLOAD_DONE:
         return
@@ -32,17 +45,35 @@ def _download_from_gdrive(data_dir: Path) -> None:
 
     data_dir.mkdir(parents=True, exist_ok=True)
 
-    # Download entire folder then remove anything that isn't a day file
-    gdown.download_folder(
-        id=GDRIVE_FOLDER_ID,
-        output=str(data_dir),
-        quiet=False,
-        use_cookies=False,
-    )
+    try:
+        # Try listing individual day files and downloading each one
+        pairs = _gdrive_file_ids(GDRIVE_FOLDER_ID)
+    except Exception:
+        pairs = []
 
-    for f in data_dir.iterdir():
-        if f.is_file() and not f.name.startswith("day_"):
-            f.unlink(missing_ok=True)
+    if pairs:
+        for file_id, name in pairs:
+            dest = data_dir / name
+            if dest.exists() and dest.stat().st_size > 1000:
+                continue
+            try:
+                gdown.download(id=file_id, output=str(dest), quiet=False, fuzzy=True)
+            except Exception:
+                pass
+    else:
+        # Fall back to full folder download and clean up non-day files
+        try:
+            gdown.download_folder(
+                id=GDRIVE_FOLDER_ID,
+                output=str(data_dir),
+                quiet=False,
+                use_cookies=False,
+            )
+            for f in data_dir.iterdir():
+                if f.is_file() and not f.name.startswith("day_"):
+                    f.unlink(missing_ok=True)
+        except Exception:
+            pass
 
 
 def _mbo_depth(val) -> float:
